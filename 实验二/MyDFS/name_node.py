@@ -29,7 +29,7 @@ class NameNode:
             listen_fd.listen(5)
             print("Name node started")
             # 添加线程，用该线程检测是否有服务器挂掉
-            t = threading.Thread(target=self.heart_beat())
+            t = threading.Thread(target=self.heart_beat)
             t.start()
             while True:
                 # 等待连接，连接后返回通信用的套接字
@@ -146,6 +146,7 @@ class NameNode:
             if host == host_name:
                 lost_blk.append(block_num)
 
+        # 对每一个丢失的块进行修复
         for block in lost_blk:
             temp_host_list = host_list.copy()
 
