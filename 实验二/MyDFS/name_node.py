@@ -31,6 +31,10 @@ class NameNode:
             # 添加线程，用该线程检测是否有服务器挂掉
             t = threading.Thread(target=self.heart_beat)
             t.start()
+            # 添加线程，用该线程检测是否有数据丢失
+            t2 = threading.Thread(target=self.data_loss_check)
+            t2.start()
+
             while True:
                 # 等待连接，连接后返回通信用的套接字
                 sock_fd, addr = listen_fd.accept()
@@ -94,10 +98,58 @@ class NameNode:
 
         return response
 
+    def get_fat_item(self, dfs_path):
+        # 获取FAT表内容
+        local_path = name_node_dir + dfs_path
+        response = pd.read_csv(local_path)
+        return response.to_csv(index=False)
+
+    def new_fat_item(self, dfs_path, file_size):
+        nb_blks = int(math.ceil(file_size / dfs_blk_size))
+        print(file_size, nb_blks)
+
+        # todo 如果dfs_replication为复数时可以新增host_name的数目
+        data_pd = pd.DataFrame(columns=['blk_no', 'host_name', 'blk_size'])
+
+        for i in range(nb_blks):
+            if dfs_replication == 1:
+                blk_no = i
+                host_name = np.random.choice(host_list, size=dfs_replication, replace=False)[0]
+                blk_size = min(dfs_blk_size, file_size - i * dfs_blk_size)
+                data_pd.loc[i] = [blk_no, host_name, blk_size]
+            else:  # 针对需要些多个副本的情况
+                blk_no = i
+                host_name_list = np.random.choice(host_list, size=dfs_replication, replace=False)
+                blk_size = min(dfs_blk_size, file_size - i * dfs_blk_size)
+                for j in range(dfs_replication):  # 每次随机选取N个host来写入当前块（N为dfs_replication）
+                    host_name = host_name_list[j]
+                    data_pd.loc[(i - 1) * dfs_replication + j] = [blk_no, host_name, blk_size]
+
+        # 获取本地路径
+        local_path = name_node_dir + dfs_path
+
+        # 若目录不存在则创建新目录
+        os.system("mkdir -p {}".format(os.path.dirname(local_path)))
+        # 保存FAT表为CSV文件
+        data_pd.to_csv(local_path, index=False)
+        # 同时返回CSV内容到请求节点
+        return data_pd.to_csv(index=False)
+
+    def rm_fat_item(self, dfs_path):
+        local_path = name_node_dir + dfs_path
+        response = pd.read_csv(local_path)
+        os.remove(local_path)
+        return response.to_csv(index=False)
+
+    def format(self):
+        format_command = "rm -rf {}/*".format(name_node_dir)
+        os.system(format_command)
+        return "Format namenode successfully~"
+
     # 模拟heart_beat操作。
     def heart_beat(self):
         time.sleep(5)
-        while True:   # 每隔一段时间轮询一遍所有服务器，查询是否有服务器挂掉
+        while True:  # 每隔一段时间轮询一遍所有服务器，查询是否有服务器挂掉
             for hostname in host_list:
                 data_node_sock = socket.socket()
                 try:
@@ -184,77 +236,72 @@ class NameNode:
             fat.loc[(fat['host_name'] == host_name) & (fat['blk_no'] == block), 'host_name'] = recover_host
             fat.to_csv(local_path, index=False)
 
+    # 检测是否有文件块丢失
     def data_loss_check(self):
-        time.sleep(5)
+        time.sleep(20)
         while True:
             self.check_dfs("/")  # 开始检查目录下的所有文件
-            time.sleep(5)
+            time.sleep(20)
 
     # 模拟一次检测操作，NameNode检测目录下的所有文件，查看是否存在缺失的情况
     def check_dfs(self, dfs_dir):
         dir = name_node_dir + dfs_dir
         all_list = os.listdir(dir)
+        # 遍历NameNode目录下的所有fat表，检查每个fat表里对应的数据块
         for item in all_list:
             path = os.path.join(dir, item)
             if os.path.isfile(path):
-                self.checkout_item(dfs_dir + item)
+                self.checkout_item(dfs_dir + '/' + item)
             else:
-                self.beat(dfs_dir + item)
+                self.check_dfs(dfs_dir + item)
 
+    # 检查某个fat表下的所有数据是否正常，如出现异常则进行修复
     def checkout_item(self, dfs_path):
         local_path = name_node_dir + dfs_path
         fat = pd.read_csv(local_path)
+        # 检查每一条数据块是否存在
         for idx, row in fat.iterrows():
             data_node_sock = socket.socket()
             data_node_sock.connect((row['host_name'], data_node_port))
+            blk_path = dfs_path + ".blk{}".format(row['blk_no'])
+            request = "check {}".format(blk_path)
+            data_node_sock.send(bytes(request, encoding='utf-8'))
+            response_msg = str(data_node_sock.recv(BUF_SIZE), encoding='utf-8')
+            data_node_sock.close()
 
-    def get_fat_item(self, dfs_path):
-        # 获取FAT表内容
-        local_path = name_node_dir + dfs_path
-        response = pd.read_csv(local_path)
-        return response.to_csv(index=False)
+            if response_msg == 'Normal':  # 正常情况
+                continue
+            else:  # 数据块发生丢失的情况，进行相关的恢复工作
+                print("{} was lost.".format(blk_path))
 
-    def new_fat_item(self, dfs_path, file_size):
-        nb_blks = int(math.ceil(file_size / dfs_blk_size))
-        print(file_size, nb_blks)
+                # 寻找包含数据块的服务器
+                choice_list = fat[fat['blk_no'] == row['blk_no']]['host_name']
+                for i in range(choice_list.size):
+                    info_host = choice_list.iloc[i]
+                    if info_host != row['host_name']:
+                        break
 
-        # todo 如果dfs_replication为复数时可以新增host_name的数目
-        data_pd = pd.DataFrame(columns=['blk_no', 'host_name', 'blk_size'])
+                # 从包含缺失数据块的服务器中拷贝一份放到备份服务器中
+                recv_data_node_sock = socket.socket()
+                recv_data_node_sock.connect((info_host, data_node_port))
+                request = "load {}".format(blk_path)
+                recv_data_node_sock.send(bytes(request, encoding='utf-8'))
+                time.sleep(0.2)  # 两次传输需要间隔一段时间，避免粘包
+                data = recv_data_node_sock.recv(BUF_SIZE)
+                data = str(data, encoding='utf-8')
+                recv_data_node_sock.close()
 
-        for i in range(nb_blks):
-            if dfs_replication == 1:
-                blk_no = i
-                host_name = np.random.choice(host_list, size=dfs_replication, replace=False)[0]
-                blk_size = min(dfs_blk_size, file_size - i * dfs_blk_size)
-                data_pd.loc[i] = [blk_no, host_name, blk_size]
-            else:  # 针对需要些多个副本的情况
-                blk_no = i
-                host_name_list = np.random.choice(host_list, size=dfs_replication, replace=False)
-                blk_size = min(dfs_blk_size, file_size - i * dfs_blk_size)
-                for j in range(dfs_replication):  # 每次随机选取N个host来写入当前块（N为dfs_replication）
-                    host_name = host_name_list[j]
-                    data_pd.loc[(i - 1) * dfs_replication + j] = [blk_no, host_name, blk_size]
+                # 存放到丢失数据块服务器中
+                push_data_node_sock = socket.socket()
+                push_data_node_sock.connect((row['host_name'], data_node_port))
+                request = "store {}".format(blk_path)
+                push_data_node_sock.send(bytes(request, encoding='utf-8'))
+                time.sleep(0.2)  # 两次传输需要间隔一段时间，避免粘包
+                push_data_node_sock.send(bytes(data, encoding='utf-8'))
+                push_data_node_sock.close()
 
-        # 获取本地路径
-        local_path = name_node_dir + dfs_path
+                print("Passing {} from {} to {}.".format(blk_path, info_host, row['host_name']))
 
-        # 若目录不存在则创建新目录
-        os.system("mkdir -p {}".format(os.path.dirname(local_path)))
-        # 保存FAT表为CSV文件
-        data_pd.to_csv(local_path, index=False)
-        # 同时返回CSV内容到请求节点
-        return data_pd.to_csv(index=False)
-
-    def rm_fat_item(self, dfs_path):
-        local_path = name_node_dir + dfs_path
-        response = pd.read_csv(local_path)
-        os.remove(local_path)
-        return response.to_csv(index=False)
-
-    def format(self):
-        format_command = "rm -rf {}/*".format(name_node_dir)
-        os.system(format_command)
-        return "Format namenode successfully~"
 
 
 # 创建NameNode并启动

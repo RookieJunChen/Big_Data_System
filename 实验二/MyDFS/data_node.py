@@ -60,6 +60,7 @@ class DataNode:
         finally:
             listen_fd.close()
 
+    # check指令，用于检测本地的数据块是否丢失
     def check(self, dfs_path):
         # 本地路径
         local_path = data_node_dir + dfs_path
