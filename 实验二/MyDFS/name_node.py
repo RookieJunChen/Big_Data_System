@@ -111,10 +111,14 @@ class NameNode:
         # todo 如果dfs_replication为复数时可以新增host_name的数目
         data_pd = pd.DataFrame(columns=['blk_no', 'host_name', 'blk_size'])
 
+        counter = 0
         for i in range(nb_blks):
             if dfs_replication == 1:
                 blk_no = i
-                host_name = np.random.choice(host_list, size=dfs_replication, replace=False)[0]
+                # host_name = np.random.choice(host_list, size=dfs_replication, replace=False)[0]
+                # 为了负载均衡，每次轮流给每个节点分发数据
+                host_name = host_list[counter]
+                counter = (counter + 1) % len(host_list)
                 blk_size = min(dfs_blk_size, file_size - i * dfs_blk_size)
                 data_pd.loc[i] = [blk_no, host_name, blk_size]
             else:  # 针对需要些多个副本的情况
@@ -301,7 +305,6 @@ class NameNode:
                 push_data_node_sock.close()
 
                 print("Passing {} from {} to {}.".format(blk_path, info_host, row['host_name']))
-
 
 
 # 创建NameNode并启动
