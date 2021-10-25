@@ -9,6 +9,7 @@ import pandas as pd
 import threading
 
 from common import *
+from tools import *
 
 
 # NameNode功能
@@ -55,14 +56,25 @@ class NameNode:
                         dfs_path = request[1]  # 指令第二个参数为DFS目标地址
                         response = self.get_fat_item(dfs_path)
                     elif cmd == "new_fat_item":  # 指令类型为新建FAT表项
-                        dfs_path = request[1]  # 指令第二个参数为DFS目标地址
-                        file_size = int(request[2])
-                        response = self.new_fat_item(dfs_path, file_size)
+                        if len(request) == 3:
+                            dfs_path = request[1]  # 指令第二个参数为DFS目标地址
+                            file_size = int(request[2])
+                            response = self.new_fat_item(dfs_path, file_size)
+                        else:
+                            dfs_path = request[1]  # 指令第二个参数为DFS目标地址
+                            file_size = int(request[2])
+                            line_number = int(request[3])
+                            response = self.new_fat_item_lines(dfs_path, file_size, line_number)
                     elif cmd == "rm_fat_item":  # 指令类型为删除FAT表项
                         dfs_path = request[1]  # 指令第二个参数为DFS目标地址
                         response = self.rm_fat_item(dfs_path)
                     elif cmd == "format":
                         response = self.format()
+                    elif cmd == "calculate":
+                        option = request[1]
+                        dfs_path = request[2]
+                        filename = request[3]
+                        response = self.calculte(option, dfs_path, filename)
                     else:  # 其他位置指令
                         response = "Undefined command: " + " ".join(request)
 
@@ -132,6 +144,38 @@ class NameNode:
         # 获取本地路径
         local_path = name_node_dir + dfs_path
 
+        # 若目录不存在则创建新目录
+        os.system("mkdir -p {}".format(os.path.dirname(local_path)))
+        # 保存FAT表为CSV文件
+        data_pd.to_csv(local_path, index=False)
+        # 同时返回CSV内容到请求节点
+        return data_pd.to_csv(index=False)
+
+    # 按行划分传输文件
+    def new_fat_item_lines(self, dfs_path, file_size, line_number):
+        # 计算每一行文件占用的大小
+        line_avg_size = int(math.ceil(file_size / line_number))
+        # 计算每个blk中平均的行数
+        lines_per_blk = int(math.floor(big_dfs_blk_size / line_avg_size))
+
+        number_blks = int(math.ceil(line_number / lines_per_blk))
+
+        print(file_size, line_number, line_avg_size, lines_per_blk)
+
+        data_pd = pd.DataFrame(columns=['blk_no', 'host_name', 'blk_size'])
+
+        counter = 0
+        for i in range(number_blks):
+            blk_no = i
+            # 为了负载均衡，每次轮流给每个节点分发数据
+            host_name = host_list[counter]
+            counter = (counter + 1) % len(host_list)
+            blk_size = min(lines_per_blk * line_avg_size,
+                           line_number * line_avg_size - i * lines_per_blk * line_avg_size)
+            data_pd.loc[i] = [blk_no, host_name, blk_size]
+
+        # 获取本地路径
+        local_path = name_node_dir + dfs_path
         # 若目录不存在则创建新目录
         os.system("mkdir -p {}".format(os.path.dirname(local_path)))
         # 保存FAT表为CSV文件
@@ -305,6 +349,69 @@ class NameNode:
                 push_data_node_sock.close()
 
                 print("Passing {} from {} to {}.".format(blk_path, info_host, row['host_name']))
+
+    # 负责计算均值或方差的命令文件，负责接收命令，调用计算，返回相关数据
+    def calculte(self, option, dfs_path, filename):
+        thread_list = []
+        # 调用多线程，同时向多个服务器发送计算的消息
+        for host in host_list:
+            t = MyThread(self.calculate_comunicater, args=(option, dfs_path, filename, host))
+            thread_list.append(t)
+            t.start()
+        map_list = []
+        # 开启的多个线程收集多个服务器map出的值
+        for t in thread_list:
+            t.join()
+            if option == "var":
+                length, mean, var = t.get_result()
+                map_list.append((length, mean, var))
+            elif option == "mean":
+                length, mean = t.get_result()
+                map_list.append((length, mean))
+        # 调用reducer整合数据，获得最终的整体数据
+        result = self.reducer(option, map_list)
+        return str(result)
+
+    # 多线程函数，负责与各个服务器进行通信
+    def calculate_comunicater(self, option, dfs_path, filename, host_name):
+        # 发送计算指令
+        data_node_sock = socket.socket()
+        data_node_sock.connect((host_name, data_node_port))
+        request = "map {} {} {}".format(option, dfs_path, filename)
+        data_node_sock.send(bytes(request, encoding='utf-8'))
+        # 接收服务器计算出的值
+        response_msg = str(data_node_sock.recv(BUF_SIZE), encoding='utf-8')
+        response = response_msg.split()
+        if option == "var":
+            length = int(response[0])
+            mean = float(response[1])
+            var = float(response[2])
+            return length, mean, var
+        elif option == "mean":
+            length = int(response[0])
+            mean = float(response[1])
+            return length, mean
+
+    # 整合数据，计算总的均值或方差
+    def reducer(self, option, map_list):
+        avg = 0.0
+        var_t = 0.0
+        total_length = 0
+        # 增量计算均值
+        if option == "mean":
+            for length, mean in map_list:
+                avg = (avg * total_length + mean * length) / (total_length + length)
+                total_length = total_length + length
+            return avg
+        # 增量计算方差
+        elif option == "var":
+            for length, mean, var in map_list:
+                avg_new = (avg * total_length + mean * length) / (total_length + length)
+                var_t = (total_length * (var_t + (avg_new - avg) ** 2) + length * (var + (avg_new - mean) ** 2)) \
+                        /  (total_length + length)
+                avg = avg_new
+                total_length = total_length + length
+            return var_t
 
 
 # 创建NameNode并启动

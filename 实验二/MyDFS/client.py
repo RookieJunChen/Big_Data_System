@@ -1,7 +1,9 @@
 import os
 import socket
 import time
+import datetime
 from io import StringIO
+import math
 
 import pandas as pd
 
@@ -69,6 +71,54 @@ class Client:
             data_last = data
             counter = (counter+1) % dfs_replication
         fp.close()
+
+    # 按行划分传输文件
+    def copyFromLocalLines(self, local_path, dfs_path):
+        file_size = os.path.getsize(local_path)
+        # 计算每个文件的行数
+        line_number = int(os.popen('cat {} | wc -l'.format(local_path)).read())
+        print("File size: {}".format(file_size))
+        print("File lines: {:d}".format(line_number))
+
+        # 计算每行的平均占用尺寸
+        line_avg_size = int(math.ceil(file_size / line_number))
+
+        # 每个blk里面的平均的行数
+        lines_per_blk = int(math.floor(big_dfs_blk_size / line_avg_size))
+        print("Lines per blk: {:d}".format(lines_per_blk))
+
+        request = "new_fat_item {} {} {}".format(dfs_path, file_size, line_number)
+        print("Request: {}".format(request))
+
+        # 从NameNode获取一张FAT表
+        self.name_node_sock.send(bytes(request, encoding='utf-8'))
+        fat_pd = self.name_node_sock.recv(BUF_SIZE)
+
+        # 打印FAT表，并使用pandas读取
+        fat_pd = str(fat_pd, encoding='utf-8')
+        print("Fat: \n{}".format(fat_pd))
+        fat = pd.read_csv(StringIO(fat_pd))
+
+        # 根据FAT表逐个向目标DataNode发送数据块
+        temp_file = local_path + '_temp'    # 用于写拆分的小文件的temp_file
+        with open(local_path, "r") as origin_file:
+            line_counter = 0
+            for idx, row in fat.iterrows():
+                # 按行写拆分的小文件，避免存在元数据在划分过程中被截断
+                depart_file = open(temp_file, "w")
+                for line in origin_file:
+                    depart_file.write(line)
+                    line_counter = line_counter + 1
+                    if line_counter >= lines_per_blk:
+                        depart_file.close()
+                        line_counter = 0
+                        break
+                if depart_file:
+                    depart_file.close()
+                # 使用scp传输大文件
+                os.system("scp {} {}:{}{}.blk{}".format(temp_file, row['host_name'], "~/MyDFS/dfs/data",
+                                                        dfs_path, row['blk_no']))
+        os.remove(temp_file)
 
     def copyToLocal(self, dfs_path, local_path):
         request = "get_fat_item {}".format(dfs_path)
@@ -141,6 +191,22 @@ class Client:
 
             data_node_sock.close()
 
+    def calculate(self, option, dfs_path, filename):
+        # 使用datetime计算运行时间
+        start = datetime.datetime.now()
+        # 发送指令
+        request = "calculate {} {} {}".format(option, dfs_path, filename)
+        self.name_node_sock.send(bytes(request, encoding='utf-8'))
+        # 接收计算出的数据
+        response_msg = self.name_node_sock.recv(BUF_SIZE)
+        print("The {} of the {} is {}".format(option, dfs_path+filename, str(response_msg, encoding='utf-8')))
+        # 统计耗费时间
+        end = datetime.datetime.now()
+        last_time = end - start
+        print("Takes {}.".format(last_time))
+
+
+
 
 # 解析命令行参数并执行对于的命令
 import sys
@@ -170,6 +236,13 @@ elif cmd == "-copyFromLocal":
         client.copyFromLocal(local_path, dfs_path)
     else:
         print("Usage: python client.py -copyFromLocal <local_path> <dfs_path>")
+elif cmd == "-copyFromLocalByLines":
+    if argc == 3:
+        local_path = argv[2]
+        dfs_path = argv[3]
+        client.copyFromLocalLines(local_path, dfs_path)
+    else:
+        print("Usage: python client.py -copyFromLocalByLines <local_path> <dfs_path>")
 elif cmd == "-copyToLocal":
     if argc == 3:
         dfs_path = argv[2]
@@ -179,6 +252,14 @@ elif cmd == "-copyToLocal":
         print("Usage: python client.py -copyFromLocal <dfs_path> <local_path>")
 elif cmd == "-format":
     client.format()
+elif cmd == "-calculate":
+    if argc == 4:
+        option = argv[2]
+        dfs_path = argv[3]
+        filename = argv[4]
+        client.calculate(option, dfs_path, filename)
+    else:
+        print("Usage: python client.py -calculate <option> <dfs_path> <filename>")
 else:
     print("Undefined command: {}".format(cmd))
     print("Usage: python client.py <-ls | -copyFromLocal | -copyToLocal | -rm | -format> other_arguments")

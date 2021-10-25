@@ -1,7 +1,10 @@
 import os
 import socket
+import re
+import numpy as np
 
 from common import *
+from tools import *
 
 
 # DataNode支持的指令有:
@@ -45,6 +48,11 @@ class DataNode:
                         response = self.rm(dfs_path)
                     elif cmd == "format":  # 格式化DFS
                         response = self.format()
+                    elif cmd == "map":
+                        option = request[1]
+                        dfs_path = request[2]
+                        filename = request[3]
+                        response = self.mapper(dfs_path, filename, option)
                     else:
                         response = "Undefined command: " + " ".join(request)
 
@@ -103,6 +111,33 @@ class DataNode:
         os.system(format_command)
 
         return "Format datanode successfully~"
+
+    # 在data_node上执行mapper操作
+    def mapper(self, dfs_path, filename, option):
+        # 使用正则表达式寻找符合条件的分块文件
+        read_format = re.compile(r"{}.(\w)*".format(filename))
+        total_list = []
+
+        # 对本服务器下所有的该文件的分块文件进行统计，计算均值或方差
+        all_list = os.listdir(data_node_dir + dfs_path)
+        for file in all_list:
+            if not read_format.search(file) == None:
+                read_file = read_format.search(file).group(0)
+                read_dir = data_node_dir + dfs_path + read_file
+                data_list = read_from_txt(read_dir)
+                total_list.extend(data_list)
+
+        # 均值无论是在求均值还是方差时都会用到，故必须计算
+        # 如果操作是求方差，则额外求方差
+        if option == "var":
+            mean = np.mean(total_list)
+            var = np.var(total_list)
+            length = len(total_list)
+            return "{} {} {}".format(length, mean, var)
+        elif option == "mean":
+            mean = np.mean(total_list)
+            length = len(total_list)
+            return "{} {}".format(length, mean)
 
 
 # 创建DataNode对象并启动
